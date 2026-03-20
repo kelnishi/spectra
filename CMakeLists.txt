@@ -18,6 +18,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 option(ENABLE_COVERAGE_BUILD "Do a coverage build" OFF)
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
+option(BUILD_WASM "Build WebAssembly module via Emscripten" OFF)
 include(FeatureSummary) # More verbose Output for libraries using set_package_properties
 
 # Look for supporting libraries
@@ -65,6 +66,10 @@ endif()
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(test)
+endif()
+
+if(BUILD_WASM)
+    add_subdirectory(wasm)
 endif()
 
 # Install the library (relative to the CMAKE_INSTALL_PREFIX)

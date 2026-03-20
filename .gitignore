@@ -9,6 +9,7 @@
 .idea/
 cmake-build*/
 build/*
+build-wasm/
 issues/*
 legacy/*
 include/Eigen/*
