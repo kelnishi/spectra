@@ -29,6 +29,8 @@ target_link_options(spectra-wasm PRIVATE
     "SHELL:-s STACK_SIZE=1048576"
     # Export malloc/free for zero-copy TypedArray → WASM heap transfers
     "SHELL:-s EXPORTED_FUNCTIONS=['_malloc','_free']"
+    # Export heap views for CSR zero-copy allocators in spectra.mjs
+    "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAP32','HEAPF64']"
     # Export exception decoding so JS can read C++ exception messages
     "SHELL:-s EXPORT_EXCEPTION_HANDLING_HELPERS=1"
 )

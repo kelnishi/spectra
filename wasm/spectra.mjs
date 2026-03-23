@@ -28,18 +28,25 @@ import createSpectraWasm from '../build-wasm/wasm/spectra.js';
 export async function createSpectra(wasmOptions) {
     const wasm = await createSpectraWasm(wasmOptions);
 
-    // Decode a C++ exception pointer into a readable error message.
-    // EXPORT_EXCEPTION_HANDLING_HELPERS provides getExceptionMessage().
+    // Decode a C++ exception into a readable JS Error.
+    // With -fwasm-exceptions, caught exceptions are WebAssembly.Exception objects.
+    // With legacy exceptions, they're raw pointer integers/bigints.
+    // EXPORT_EXCEPTION_HANDLING_HELPERS provides getExceptionMessage() for both.
     function decodeException(err) {
-        if (typeof err === 'number' || typeof err === 'bigint') {
-            try {
-                const [type, msg] = wasm.getExceptionMessage(err);
-                return new Error(`${type}: ${msg}`);
-            } catch {
-                return new Error(`C++ exception (pointer: ${err})`);
+        try {
+            // getExceptionMessage handles both WebAssembly.Exception and raw pointers
+            const [type, msg] = wasm.getExceptionMessage(err);
+            const decoded = new Error(msg ? `${type}: ${msg}` : type);
+            decoded.name = type;
+            if (err instanceof WebAssembly.Exception && err.stack) {
+                decoded.stack = err.stack;
             }
+            return decoded;
+        } catch {
+            // Fallback if decoding fails
+            if (err instanceof Error) return err;
+            return new Error(`C++ exception: ${err}`);
         }
-        return err;
     }
 
     // Wrap a WASM function so its last argument is an optional JS progress callback.
