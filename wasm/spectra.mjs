@@ -28,17 +28,34 @@ import createSpectraWasm from '../build-wasm/wasm/spectra.js';
 export async function createSpectra(wasmOptions) {
     const wasm = await createSpectraWasm(wasmOptions);
 
+    // Decode a C++ exception pointer into a readable error message.
+    // EXPORT_EXCEPTION_HANDLING_HELPERS provides getExceptionMessage().
+    function decodeException(err) {
+        if (typeof err === 'number' || typeof err === 'bigint') {
+            try {
+                const [type, msg] = wasm.getExceptionMessage(err);
+                return new Error(`${type}: ${msg}`);
+            } catch {
+                return new Error(`C++ exception (pointer: ${err})`);
+            }
+        }
+        return err;
+    }
+
     // Wrap a WASM function so its last argument is an optional JS progress callback.
     // If omitted or null/undefined, passes undefined to the C++ side (no-op).
+    // Also decodes C++ exceptions into readable JS errors.
     function withProgress(wasmFn) {
         return function (...args) {
             const last = args[args.length - 1];
-            if (typeof last === 'function') {
-                return wasmFn.apply(wasm, args);
+            if (typeof last !== 'function') {
+                args.push(undefined);
             }
-            // No callback provided — append undefined
-            args.push(undefined);
-            return wasmFn.apply(wasm, args);
+            try {
+                return wasmFn.apply(wasm, args);
+            } catch (err) {
+                throw decodeException(err);
+            }
         };
     }
 
@@ -46,15 +63,18 @@ export async function createSpectra(wasmOptions) {
     // Zero-copy CSR helpers: allocate in WASM heap, bulk-copy once,
     // call the C++ function with raw pointers, then free.
     // ----------------------------------------------------------------
+    // MEMORY64: _malloc returns BigInt; heap .set() needs a Number offset.
+    // Number(ptr) is safe — wasm64 addresses are at most 48 bits,
+    // well within Number.MAX_SAFE_INTEGER.
     function allocI32(arr) {
         const ptr = wasm._malloc(arr.byteLength);
-        wasm.HEAP32.set(arr, ptr >> 2);
+        wasm.HEAP32.set(arr, Number(ptr) / 4);
         return ptr;
     }
 
     function allocF64(arr) {
         const ptr = wasm._malloc(arr.byteLength);
-        wasm.HEAPF64.set(arr, ptr >> 3);
+        wasm.HEAPF64.set(arr, Number(ptr) / 8);
         return ptr;
     }
 
@@ -66,6 +86,8 @@ export async function createSpectra(wasmOptions) {
         const vPtr = allocF64(values instanceof Float64Array ? values : new Float64Array(values));
         try {
             return wasmFn.call(wasm, roPtr, ciPtr, vPtr, ...rest);
+        } catch (err) {
+            throw decodeException(err);
         } finally {
             wasm._free(roPtr);
             wasm._free(ciPtr);
@@ -87,6 +109,8 @@ export async function createSpectra(wasmOptions) {
                 roPtrA, ciPtrA, vPtrA, vA.length,
                 roPtrB, ciPtrB, vPtrB, vB.length,
                 ...rest);
+        } catch (err) {
+            throw decodeException(err);
         } finally {
             wasm._free(roPtrA);
             wasm._free(ciPtrA);

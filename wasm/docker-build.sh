@@ -9,13 +9,15 @@ echo "=== Building Spectra WASM via Docker (${BUILD_TYPE}) ==="
 docker run --rm \
     -v "${REPO_DIR}":/src \
     -w /src \
-    emscripten/emsdk:3.1.51 \
+    emscripten/emsdk:4.0.23 \
     bash -c "
         mkdir -p build-wasm && cd build-wasm &&
         emcmake cmake .. \
             -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
             -DBUILD_WASM=ON \
-            -DCPM_DOWNLOAD_ALL=ON &&
+            -DCPM_DOWNLOAD_ALL=ON \
+            -DCMAKE_C_FLAGS='-sMEMORY64=1' \
+            -DCMAKE_CXX_FLAGS='-sMEMORY64=1' &&
         emmake make -j\$(nproc) spectra-wasm
     "
 

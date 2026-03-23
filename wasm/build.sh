@@ -24,7 +24,9 @@ cd "${BUILD_DIR}"
 emcmake cmake "${REPO_DIR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DBUILD_WASM=ON \
-    -DCPM_DOWNLOAD_ALL=ON
+    -DCPM_DOWNLOAD_ALL=ON \
+    -DCMAKE_C_FLAGS="-sMEMORY64=1" \
+    -DCMAKE_CXX_FLAGS="-sMEMORY64=1"
 
 emmake make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" spectra-wasm
 

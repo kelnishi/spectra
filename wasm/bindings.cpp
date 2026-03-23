@@ -361,7 +361,7 @@ static val makeRealResult(SolverType& solver)
     val result = val::object();
     result.set("converged", solver.info() == CompInfo::Successful);
     result.set("info", compInfoToString(solver.info()));
-    result.set("numIter", solver.num_iterations());
+    result.set("numIter", (int)solver.num_iterations());
     result.set("numOps", g_progress.opsCompleted);
     if (solver.info() == CompInfo::Successful)
     {
@@ -377,7 +377,7 @@ static val makeComplexResult(SolverType& solver)
     val result = val::object();
     result.set("converged", solver.info() == CompInfo::Successful);
     result.set("info", compInfoToString(solver.info()));
-    result.set("numIter", solver.num_iterations());
+    result.set("numIter", (int)solver.num_iterations());
     result.set("numOps", g_progress.opsCompleted);
     if (solver.info() == CompInfo::Successful)
     {
@@ -394,7 +394,7 @@ static val makeRealResultTyped(SolverType& solver)
     val result = val::object();
     result.set("converged", solver.info() == CompInfo::Successful);
     result.set("info", compInfoToString(solver.info()));
-    result.set("numIter", solver.num_iterations());
+    result.set("numIter", (int)solver.num_iterations());
     result.set("numOps", g_progress.opsCompleted);
     if (solver.info() == CompInfo::Successful)
     {
@@ -410,7 +410,7 @@ static val makeComplexResultTyped(SolverType& solver)
     val result = val::object();
     result.set("converged", solver.info() == CompInfo::Successful);
     result.set("info", compInfoToString(solver.info()));
-    result.set("numIter", solver.num_iterations());
+    result.set("numIter", (int)solver.num_iterations());
     result.set("numOps", g_progress.opsCompleted);
     if (solver.info() == CompInfo::Successful)
     {
@@ -620,7 +620,7 @@ static val davidsonSymEigs(const val& matData, int n, int nev,
     val result = val::object();
     result.set("converged", solver.info() == CompInfo::Successful);
     result.set("info", compInfoToString(solver.info()));
-    result.set("numIter", solver.num_iterations());
+    result.set("numIter", (int)solver.num_iterations());
     result.set("numOps", g_progress.opsCompleted);
     if (solver.info() == CompInfo::Successful)
     {
