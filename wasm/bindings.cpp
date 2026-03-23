@@ -191,6 +191,26 @@ static Eigen::MatrixXd ptrToMatrix(uintptr_t dataPtr, int rows, int cols)
     return Eigen::MatrixXd(mapped);
 }
 
+// Build a sparse initial block vector for LOBPCG with guaranteed full rank.
+// Each column has exactly one non-zero entry (value 1.0) at a strided row,
+// so the block vector is always rank-nev regardless of matrix size.
+// This avoids the sparseView() pitfall where near-zero random values get
+// dropped, leaving a rank-deficient X that causes OOB inside the solver.
+static Eigen::SparseMatrix<double> makeLobpcgInitial(int n, int nev)
+{
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(nev);
+    for (int j = 0; j < nev; j++)
+    {
+        // Spread pivots evenly across rows to avoid clustering
+        int row = (int)(((long long)j * n) / nev);
+        trips.emplace_back(row, j, 1.0);
+    }
+    Eigen::SparseMatrix<double> X(n, nev);
+    X.setFromTriplets(trips.begin(), trips.end());
+    return X;
+}
+
 static SortRule parseSortRule(const std::string& rule)
 {
     if (rule == "LargestMagn") return SortRule::LargestMagn;
@@ -846,8 +866,7 @@ static val lobpcg(const val& tripsA, int n, int nev,
                   int maxIter, double tol)
 {
     Eigen::SparseMatrix<double> A = jsTripletsToSparse(tripsA, n, n);
-    Eigen::MatrixXd X_dense = Eigen::MatrixXd::Random(n, nev);
-    Eigen::SparseMatrix<double> X(X_dense.sparseView());
+    Eigen::SparseMatrix<double> X = makeLobpcgInitial(n, nev);
 
     LOBPCGSolver<double> solver(A, X);
     solver.compute(maxIter, tol);
@@ -868,8 +887,7 @@ static val lobpcgGeneralized(const val& tripsA, const val& tripsB,
 {
     Eigen::SparseMatrix<double> A = jsTripletsToSparse(tripsA, n, n);
     Eigen::SparseMatrix<double> B = jsTripletsToSparse(tripsB, n, n);
-    Eigen::MatrixXd X_dense = Eigen::MatrixXd::Random(n, nev);
-    Eigen::SparseMatrix<double> X(X_dense.sparseView());
+    Eigen::SparseMatrix<double> X = makeLobpcgInitial(n, nev);
 
     LOBPCGSolver<double> solver(A, X);
     solver.setB(B);
@@ -1096,8 +1114,7 @@ static val lobpcgCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr,
                       int maxIter, double tol)
 {
     auto A = ptrToSparseCSR(roPtr, ciPtr, vPtr, n, n, nnz);
-    Eigen::MatrixXd X_dense = Eigen::MatrixXd::Random(n, nev);
-    Eigen::SparseMatrix<double> X(X_dense.sparseView());
+    Eigen::SparseMatrix<double> X = makeLobpcgInitial(n, nev);
 
     LOBPCGSolver<double> solver(A, X);
     solver.compute(maxIter, tol);
@@ -1117,8 +1134,7 @@ static val lobpcgGeneralizedCSR(uintptr_t roA, uintptr_t ciA, uintptr_t vA, int 
 {
     auto A = ptrToSparseCSR(roA, ciA, vA, n, n, nnzA);
     auto B = ptrToSparseCSR(roB, ciB, vB, n, n, nnzB);
-    Eigen::MatrixXd X_dense = Eigen::MatrixXd::Random(n, nev);
-    Eigen::SparseMatrix<double> X(X_dense.sparseView());
+    Eigen::SparseMatrix<double> X = makeLobpcgInitial(n, nev);
 
     LOBPCGSolver<double> solver(A, X);
     solver.setB(B);

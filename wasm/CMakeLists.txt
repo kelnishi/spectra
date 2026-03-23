@@ -18,5 +18,4 @@ target_link_options(spectra-wasm PRIVATE
     "SHELL:-s WASM=1"
     # Export malloc/free for zero-copy TypedArray → WASM heap transfers
     "SHELL:-s EXPORTED_FUNCTIONS=['_malloc','_free']"
-    "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAP32','HEAPF64']"
 )

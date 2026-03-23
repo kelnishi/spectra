@@ -47,15 +47,13 @@ export async function createSpectra(wasmOptions) {
     // call the C++ function with raw pointers, then free.
     // ----------------------------------------------------------------
     function allocI32(arr) {
-        const bytes = arr.byteLength;
-        const ptr = wasm._malloc(bytes);
+        const ptr = wasm._malloc(arr.byteLength);
         wasm.HEAP32.set(arr, ptr >> 2);
         return ptr;
     }
 
     function allocF64(arr) {
-        const bytes = arr.byteLength;
-        const ptr = wasm._malloc(bytes);
+        const ptr = wasm._malloc(arr.byteLength);
         wasm.HEAPF64.set(arr, ptr >> 3);
         return ptr;
     }
