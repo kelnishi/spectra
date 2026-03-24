@@ -452,8 +452,12 @@ public:
             DenseSymMatProd<Scalar> Aop(gramA);
             DenseCholesky<Scalar> Bop(gramB);
 
+            // ncv must satisfy nev + 2 <= ncv <= n (required by HermEigsBase).
+            // Original code used min(10, n-1) which can violate nev < ncv when nev >= 10.
+            int gram_n = int(gramA.rows());
+            int ncv = (std::min)((std::max)(m_nev + 2, 2 * m_nev + 1), gram_n);
             SymGEigsSolver<DenseSymMatProd<Scalar>, DenseCholesky<Scalar>, GEigsMode::Cholesky>
-                geigs(Aop, Bop, m_nev, (std::min)(10, int(gramA.rows()) - 1));
+                geigs(Aop, Bop, m_nev, ncv);
 
             geigs.init();
             geigs.compute(SortRule::SmallestAlge);

@@ -211,6 +211,37 @@ static Eigen::SparseMatrix<double> makeLobpcgInitial(int n, int nev)
     return X;
 }
 
+// ============================================================
+// Exception-safe wrapper for embind-registered solver functions.
+// Catches C++ exceptions in WASM (which would otherwise become
+// opaque WebAssembly.Exception objects) and returns the error
+// message in the result object so JS callers get readable errors.
+// ============================================================
+template <auto>
+struct SafeWrap;
+
+template <typename... Args, val (*Fn)(Args...)>
+struct SafeWrap<Fn>
+{
+    static val call(Args... args)
+    {
+        try
+        {
+            return Fn(std::forward<Args>(args)...);
+        }
+        catch (const std::exception& e)
+        {
+            val result = val::object();
+            result.set("converged", false);
+            result.set("info", "Exception");
+            result.set("error", std::string(e.what()));
+            return result;
+        }
+    }
+};
+
+#define SAFE(fn) &SafeWrap<&fn>::call
+
 static SortRule parseSortRule(const std::string& rule)
 {
     if (rule == "LargestMagn") return SortRule::LargestMagn;
@@ -1153,61 +1184,65 @@ static val lobpcgGeneralizedCSR(uintptr_t roA, uintptr_t ciA, uintptr_t vA, int 
 // ============================================================
 EMSCRIPTEN_BINDINGS(spectra)
 {
-    // Utility
+    // Utility (no solver — no exception wrapping needed)
     function("estimateOps", &estimateOps);
 
+    // All solver functions wrapped with SAFE() to catch C++ exceptions
+    // and return {converged: false, error: "..."} instead of opaque
+    // WebAssembly.Exception objects.
+
     // Dense standard eigenvalue solvers
-    function("symEigs", &symEigs);
-    function("symEigsShift", &symEigsShift);
-    function("genEigs", &genEigs);
-    function("genEigsRealShift", &genEigsRealShift);
-    function("genEigsComplexShift", &genEigsComplexShift);
+    function("symEigs", SAFE(symEigs));
+    function("symEigsShift", SAFE(symEigsShift));
+    function("genEigs", SAFE(genEigs));
+    function("genEigsRealShift", SAFE(genEigsRealShift));
+    function("genEigsComplexShift", SAFE(genEigsComplexShift));
 
     // Dense generalized symmetric eigenvalue solvers
-    function("symGEigsCholesky", &symGEigsCholesky);
-    function("symGEigsShiftInvert", &symGEigsShiftInvert);
-    function("symGEigsBuckling", &symGEigsBuckling);
-    function("symGEigsCayley", &symGEigsCayley);
+    function("symGEigsCholesky", SAFE(symGEigsCholesky));
+    function("symGEigsShiftInvert", SAFE(symGEigsShiftInvert));
+    function("symGEigsBuckling", SAFE(symGEigsBuckling));
+    function("symGEigsCayley", SAFE(symGEigsCayley));
 
     // Davidson solver
-    function("davidsonSymEigs", &davidsonSymEigs);
+    function("davidsonSymEigs", SAFE(davidsonSymEigs));
 
     // Dense partial SVD
-    function("partialSVD", &partialSVD);
+    function("partialSVD", SAFE(partialSVD));
 
     // Sparse standard eigenvalue solvers
-    function("sparseSymEigs", &sparseSymEigs);
-    function("sparseSymEigsShift", &sparseSymEigsShift);
-    function("sparseGenEigs", &sparseGenEigs);
-    function("sparseGenEigsRealShift", &sparseGenEigsRealShift);
-    function("sparseGenEigsComplexShift", &sparseGenEigsComplexShift);
+    function("sparseSymEigs", SAFE(sparseSymEigs));
+    function("sparseSymEigsShift", SAFE(sparseSymEigsShift));
+    function("sparseGenEigs", SAFE(sparseGenEigs));
+    function("sparseGenEigsRealShift", SAFE(sparseGenEigsRealShift));
+    function("sparseGenEigsComplexShift", SAFE(sparseGenEigsComplexShift));
 
     // Sparse generalized symmetric eigenvalue solvers
-    function("sparseSymGEigsCholesky", &sparseSymGEigsCholesky);
-    function("sparseSymGEigsRegularInverse", &sparseSymGEigsRegularInverse);
-    function("sparseSymGEigsShiftInvert", &sparseSymGEigsShiftInvert);
-    function("sparseSymGEigsBuckling", &sparseSymGEigsBuckling);
-    function("sparseSymGEigsCayley", &sparseSymGEigsCayley);
+    function("sparseSymGEigsCholesky", SAFE(sparseSymGEigsCholesky));
+    function("sparseSymGEigsRegularInverse", SAFE(sparseSymGEigsRegularInverse));
+    function("sparseSymGEigsShiftInvert", SAFE(sparseSymGEigsShiftInvert));
+    function("sparseSymGEigsBuckling", SAFE(sparseSymGEigsBuckling));
+    function("sparseSymGEigsCayley", SAFE(sparseSymGEigsCayley));
 
     // Sparse partial SVD
-    function("sparsePartialSVD", &sparsePartialSVD);
+    function("sparsePartialSVD", SAFE(sparsePartialSVD));
 
     // LOBPCG solvers
-    function("lobpcg", &lobpcg);
-    function("lobpcgGeneralized", &lobpcgGeneralized);
+    function("lobpcg", SAFE(lobpcg));
+    function("lobpcgGeneralized", SAFE(lobpcgGeneralized));
 
     // CSR pointer-based sparse solvers (zero-copy TypedArray input)
-    function("sparseSymEigsCSR", &sparseSymEigsCSR);
-    function("sparseSymEigsShiftCSR", &sparseSymEigsShiftCSR);
-    function("sparseGenEigsCSR", &sparseGenEigsCSR);
-    function("sparseGenEigsRealShiftCSR", &sparseGenEigsRealShiftCSR);
-    function("sparseGenEigsComplexShiftCSR", &sparseGenEigsComplexShiftCSR);
-    function("sparseSymGEigsCholeskyCSR", &sparseSymGEigsCholeskyCSR);
-    function("sparseSymGEigsRegularInverseCSR", &sparseSymGEigsRegularInverseCSR);
-    function("sparseSymGEigsShiftInvertCSR", &sparseSymGEigsShiftInvertCSR);
-    function("sparseSymGEigsBucklingCSR", &sparseSymGEigsBucklingCSR);
-    function("sparseSymGEigsCayleyCSR", &sparseSymGEigsCayleyCSR);
-    function("sparsePartialSVDCSR", &sparsePartialSVDCSR);
-    function("lobpcgCSR", &lobpcgCSR);
-    function("lobpcgGeneralizedCSR", &lobpcgGeneralizedCSR);
+    function("sparseSymEigsCSR", SAFE(sparseSymEigsCSR));
+    function("sparseSymEigsShiftCSR", SAFE(sparseSymEigsShiftCSR));
+    function("sparseGenEigsCSR", SAFE(sparseGenEigsCSR));
+    function("sparseGenEigsRealShiftCSR", SAFE(sparseGenEigsRealShiftCSR));
+    function("sparseGenEigsComplexShiftCSR", SAFE(sparseGenEigsComplexShiftCSR));
+    function("sparseSymGEigsCholeskyCSR", SAFE(sparseSymGEigsCholeskyCSR));
+    function("sparseSymGEigsRegularInverseCSR", SAFE(sparseSymGEigsRegularInverseCSR));
+    function("sparseSymGEigsShiftInvertCSR", SAFE(sparseSymGEigsShiftInvertCSR));
+    function("sparseSymGEigsBucklingCSR", SAFE(sparseSymGEigsBucklingCSR));
+    function("sparseSymGEigsCayleyCSR", SAFE(sparseSymGEigsCayleyCSR));
+    function("sparsePartialSVDCSR", SAFE(sparsePartialSVDCSR));
+    function("lobpcgCSR", SAFE(lobpcgCSR));
+    function("lobpcgGeneralizedCSR", SAFE(lobpcgGeneralizedCSR));
 }
