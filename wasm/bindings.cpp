@@ -1180,6 +1180,52 @@ static val lobpcgGeneralizedCSR(uintptr_t roA, uintptr_t ciA, uintptr_t vA, int 
 }
 
 // ============================================================
+// Standalone Eigen linear solvers (not Spectra eigenvalue solvers)
+// ============================================================
+
+// Sparse Cholesky solve: Ax = b for symmetric positive-definite A.
+// Uses Eigen's SimplicialLLT.  Accepts one CSR matrix and a dense RHS.
+// nrhs = number of right-hand-side columns (1 for a single vector).
+static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
+                              uintptr_t bPtr, int rows, int nrhs)
+{
+    auto A = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
+    const double* bData = reinterpret_cast<const double*>(bPtr);
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+        B(bData, rows, nrhs);
+
+    Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
+    solver.compute(A);
+
+    val result = val::object();
+    if (solver.info() != Eigen::Success)
+    {
+        result.set("success", false);
+        result.set("error", std::string("Cholesky factorization failed"));
+        return result;
+    }
+
+    Eigen::MatrixXd X = solver.solve(B);
+    if (solver.info() != Eigen::Success)
+    {
+        result.set("success", false);
+        result.set("error", std::string("Cholesky solve failed"));
+        return result;
+    }
+
+    result.set("success", true);
+    if (nrhs == 1)
+    {
+        result.set("x", eigenVecToFloat64Array(Eigen::VectorXd(X.col(0))));
+    }
+    else
+    {
+        result.set("x", eigenMatToFloat64Array(X));
+    }
+    return result;
+}
+
+// ============================================================
 // Embind module
 // ============================================================
 EMSCRIPTEN_BINDINGS(spectra)
@@ -1245,4 +1291,7 @@ EMSCRIPTEN_BINDINGS(spectra)
     function("sparsePartialSVDCSR", SAFE(sparsePartialSVDCSR));
     function("lobpcgCSR", SAFE(lobpcgCSR));
     function("lobpcgGeneralizedCSR", SAFE(lobpcgGeneralizedCSR));
+
+    // Standalone Eigen linear solvers
+    function("sparseCholeskyCSR", SAFE(sparseCholeskyCSR));
 }

@@ -272,6 +272,29 @@ export async function createSpectra(wasmOptions) {
                 return withCSR2(wasm.lobpcgGeneralizedCSR, roA, ciA, vA, roB, ciB, vB,
                     n, nev, maxIter, tol);
             },
+
+            // Standalone Eigen linear solvers
+            //   sparseCholesky(rowOffsets, colIndices, values, rows, b, nrhs?)
+            //   Solves Ax = b for SPD matrix A.  b is Float64Array (length = rows * nrhs).
+            //   nrhs defaults to 1.  Returns { success, x, error? }.
+            sparseCholesky(rowOffsets, colIndices, values, rows, b, nrhs) {
+                nrhs = nrhs || 1;
+                const roPtr = allocI32(rowOffsets instanceof Int32Array ? rowOffsets : new Int32Array(rowOffsets));
+                const ciPtr = allocI32(colIndices instanceof Int32Array ? colIndices : new Int32Array(colIndices));
+                const vPtr = allocF64(values instanceof Float64Array ? values : new Float64Array(values));
+                const bPtr = allocF64(b instanceof Float64Array ? b : new Float64Array(b));
+                try {
+                    return wasm.sparseCholeskyCSR(roPtr, ciPtr, vPtr, values.length,
+                        bPtr, rows, nrhs);
+                } catch (err) {
+                    throw decodeException(err);
+                } finally {
+                    wasm._free(roPtr);
+                    wasm._free(ciPtr);
+                    wasm._free(vPtr);
+                    wasm._free(bPtr);
+                }
+            },
         },
 
         // Direct access to the underlying WASM module
