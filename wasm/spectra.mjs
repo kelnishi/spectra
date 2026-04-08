@@ -70,18 +70,15 @@ export async function createSpectra(wasmOptions) {
     // Zero-copy CSR helpers: allocate in WASM heap, bulk-copy once,
     // call the C++ function with raw pointers, then free.
     // ----------------------------------------------------------------
-    // MEMORY64: _malloc returns BigInt; heap .set() needs a Number offset.
-    // Number(ptr) is safe — wasm64 addresses are at most 48 bits,
-    // well within Number.MAX_SAFE_INTEGER.
     function allocI32(arr) {
         const ptr = wasm._malloc(arr.byteLength);
-        wasm.HEAP32.set(arr, Number(ptr) / 4);
+        wasm.HEAP32.set(arr, ptr / 4);
         return ptr;
     }
 
     function allocF64(arr) {
         const ptr = wasm._malloc(arr.byteLength);
-        wasm.HEAPF64.set(arr, Number(ptr) / 8);
+        wasm.HEAPF64.set(arr, ptr / 8);
         return ptr;
     }
 

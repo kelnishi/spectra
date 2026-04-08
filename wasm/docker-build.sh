@@ -16,8 +16,8 @@ docker run --rm \
             -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
             -DBUILD_WASM=ON \
             -DCPM_DOWNLOAD_ALL=ON \
-            -DCMAKE_C_FLAGS='-sMEMORY64=1' \
-            -DCMAKE_CXX_FLAGS='-sMEMORY64=1' &&
+            -DCMAKE_C_FLAGS='' \
+            -DCMAKE_CXX_FLAGS='' &&
         emmake make -j\$(nproc) spectra-wasm
     "
 

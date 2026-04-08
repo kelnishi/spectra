@@ -22,9 +22,6 @@ target_link_options(spectra-wasm PRIVATE
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
     "SHELL:-s ENVIRONMENT=web,node"
     "SHELL:-s WASM=1"
-    # 64-bit memory — passed at configure time via CMAKE_CXX_FLAGS so the
-    # toolchain sets sizeof(void*)=8; repeated here for the linker.
-    "SHELL:-s MEMORY64=1"
     "SHELL:-s WASM_BIGINT=1"
     "SHELL:-s STACK_SIZE=1048576"
     # Export malloc/free for zero-copy TypedArray → WASM heap transfers
