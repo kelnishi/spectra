@@ -272,8 +272,10 @@ export async function createSpectra(wasmOptions) {
 
             // Standalone Eigen linear solvers
             //   sparseCholesky(rowOffsets, colIndices, values, rows, b, nrhs?)
-            //   Solves Ax = b for SPD matrix A.  b is Float64Array (length = rows * nrhs).
-            //   nrhs defaults to 1.  Returns { success, x, error? }.
+            //   Solves AX = B for SPD matrix A (only its lower triangle is read) with one
+            //   SimplicialLDLT factorization.  b is a row-major Float64Array
+            //   (length = rows * nrhs); nrhs defaults to 1.  Returns
+            //   { success: true, x, stats } or { success: false, info, error }.
             sparseCholesky(rowOffsets, colIndices, values, rows, b, nrhs) {
                 nrhs = nrhs || 1;
                 const roPtr = allocI32(rowOffsets instanceof Int32Array ? rowOffsets : new Int32Array(rowOffsets));

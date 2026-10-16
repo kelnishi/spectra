@@ -1,4 +1,5 @@
 #include <emscripten/bind.h>
+#include <emscripten/emscripten.h>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <Spectra/SymEigsSolver.h>
@@ -30,6 +31,10 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <new>
 
 using namespace emscripten;
 using namespace Spectra;
@@ -1183,46 +1188,283 @@ static val lobpcgGeneralizedCSR(uintptr_t roA, uintptr_t ciA, uintptr_t vA, int 
 // Standalone Eigen linear solvers (not Spectra eigenvalue solvers)
 // ============================================================
 
-// Sparse Cholesky solve: Ax = b for symmetric positive-definite A.
-// Uses Eigen's SimplicialLLT.  Accepts one CSR matrix and a dense RHS.
-// nrhs = number of right-hand-side columns (1 for a single vector).
-static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
-                              uintptr_t bPtr, int rows, int nrhs)
+// Sparse symmetric positive definite solve: A X = B, one factorization and
+// any number of right-hand sides.
+//
+// Contract (Kelcite's spectral_wasm.ts relies on it):
+//   roPtr, ciPtr, vPtr  CSR arrays of A in the WASM heap (int32 row offsets of
+//                       length rows + 1, int32 column indices and float64
+//                       values of length nnz).  A must be symmetric; only its
+//                       lower triangle is read.
+//   bPtr                Dense B in the heap, row-major rows x nrhs
+//                       (b[row * nrhs + col]).  B is scratch space: the solve
+//                       runs in place, and on success the buffer holds X in the
+//                       same layout.  The caller still owns and frees it.
+//   Returns             { success: true, x, stats } where x is a Float64Array of
+//                       length rows when nrhs == 1, otherwise
+//                       { data: Float64Array (row-major), rows, cols }.
+//                       x is a copy, so it stays valid after the caller frees B.
+//                       On failure: { success: false, info, error } with info one
+//                       of "InvalidInput", "NotPositiveDefinite", "Exception".
+//   stats               { analyzeMs, factorizeMs, solveMs, factorNnz, minPivot,
+//                         maxPivot } for logging and diagnostics.
+//
+// The factorization is Eigen's SimplicialLDLT with an AMD fill-reducing
+// ordering.  LDLT only stops on an exactly zero pivot, so a matrix that is
+// indefinite or singular would otherwise factor "successfully"; the pivots in
+// D are checked here instead.
+//
+// The triangular solves are done here rather than through solver.solve(),
+// because Eigen walks the whole factor once per right-hand side.  The
+// row-major layout puts the nrhs values of one row next to each other, so a
+// single pass over L updates every right-hand side with a contiguous,
+// vectorizable loop.
+using CholeskyLDLT = Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>, Eigen::Lower,
+                                           Eigen::AMDOrdering<int>>;
+
+static std::string formatPivot(double value)
 {
-    auto A = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
-    const double* bData = reinterpret_cast<const double*>(bPtr);
-    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-        B(bData, rows, nrhs);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.3g", value);
+    return buffer;
+}
 
-    Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
-
+static val choleskyFailure(const char* info, const std::string& message)
+{
     val result = val::object();
-    if (solver.info() != Eigen::Success)
+    result.set("success", false);
+    result.set("info", std::string(info));
+    result.set("error", message);
+    return result;
+}
+
+// Returns an empty string when the CSR arrays describe a valid rows x rows matrix.
+static std::string validateSquareCSR(const int* ro, const int* ci, int rows, int nnz)
+{
+    if (ro[0] != 0)
+        return "row offsets must start at 0";
+    if (ro[rows] != nnz)
+        return "row offsets end at " + std::to_string(ro[rows]) + " but nnz is " + std::to_string(nnz);
+    for (int i = 0; i < rows; i++)
     {
-        result.set("success", false);
-        result.set("error", std::string("Cholesky factorization failed"));
-        return result;
+        if (ro[i + 1] < ro[i])
+            return "row offsets decrease at row " + std::to_string(i);
+        for (int p = ro[i]; p < ro[i + 1]; p++)
+        {
+            if (ci[p] < 0 || ci[p] >= rows)
+                return "column index " + std::to_string(ci[p]) + " out of range in row " + std::to_string(i);
+        }
+    }
+    return std::string();
+}
+
+// The triangular solves below run as many short calls over column ranges
+// instead of one long loop.  V8 starts WebAssembly functions in its baseline
+// compiler and swaps in optimized code only for later calls, never for a call
+// already running, so one long loop would run unoptimized from start to end.
+// Short calls switch to the optimized code partway through the first solve.
+static constexpr int kSolveColumnsPerCall = 1024;
+
+// Forward substitution Y <- L^-1 Y for columns [j0, j1) of the unit lower
+// triangular L (compressed columns, diagonal not stored), on the row-major
+// n x k block Y.
+__attribute__((noinline)) static void ldltForwardColumns(const int* Lp, const int* Li, const double* Lx,
+                                                         double* Y, int k, int j0, int j1)
+{
+    for (int j = j0; j < j1; j++)
+    {
+        const double* __restrict yj = Y + std::size_t(j) * k;
+        for (int p = Lp[j]; p < Lp[j + 1]; p++)
+        {
+            double* __restrict yi = Y + std::size_t(Li[p]) * k;
+            const double l = Lx[p];
+            for (int c = 0; c < k; c++)
+                yi[c] -= l * yj[c];
+        }
+    }
+}
+
+// Y <- D^-1 Y, then back substitution Y <- L^-T Y, for columns [j0, j1) in
+// descending order.  Every row a column reads (Li[p] > j) is already final.
+__attribute__((noinline)) static void ldltBackwardColumns(const int* Lp, const int* Li, const double* Lx,
+                                                          const double* D, double* Y, int k, int j0, int j1)
+{
+    for (int j = j1 - 1; j >= j0; j--)
+    {
+        double* __restrict yj = Y + std::size_t(j) * k;
+        const double inv = 1.0 / D[j];
+        for (int c = 0; c < k; c++)
+            yj[c] *= inv;
+        for (int p = Lp[j]; p < Lp[j + 1]; p++)
+        {
+            const double* __restrict yi = Y + std::size_t(Li[p]) * k;
+            const double l = Lx[p];
+            for (int c = 0; c < k; c++)
+                yj[c] -= l * yi[c];
+        }
+    }
+}
+
+// Y <- L^-T D^-1 L^-1 Y on the row-major n x k block Y.
+static void ldltSolveInPlace(const Eigen::SparseMatrix<double>& L, const Eigen::VectorXd& D,
+                             double* Y, int k)
+{
+    const int n = int(L.cols());
+    const int* Lp = L.outerIndexPtr();
+    const int* Li = L.innerIndexPtr();
+    const double* Lx = L.valuePtr();
+
+    for (int j0 = 0; j0 < n; j0 += kSolveColumnsPerCall)
+        ldltForwardColumns(Lp, Li, Lx, Y, k, j0, std::min(n, j0 + kSolveColumnsPerCall));
+    for (int j1 = n; j1 > 0; j1 -= kSolveColumnsPerCall)
+        ldltBackwardColumns(Lp, Li, Lx, D.data(), Y, k, std::max(0, j1 - kSolveColumnsPerCall), j1);
+}
+
+// Eigen's numeric factorization is a single long call, so the tiering above
+// cannot help it within one solve.  The first sparseCholeskyCSR call therefore
+// factors a small grid Laplacian first.  That makes V8 compile optimized code
+// for the factorization and ordering in the background while the real
+// matrix's symbolic analysis runs, and the real factorization starts in
+// optimized code.  It costs a few milliseconds once per module instance.
+static void warmUpCholeskyTiers()
+{
+    static bool warmed = false;
+    if (warmed)
+        return;
+    warmed = true;
+
+    const int side = 40, n = side * side;
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(5 * n);
+    for (int r = 0; r < side; r++)
+    {
+        for (int c = 0; c < side; c++)
+        {
+            const int i = r * side + c;
+            trips.emplace_back(i, i, 4.1);
+            if (c + 1 < side) { trips.emplace_back(i, i + 1, -1.0); trips.emplace_back(i + 1, i, -1.0); }
+            if (r + 1 < side) { trips.emplace_back(i, i + side, -1.0); trips.emplace_back(i + side, i, -1.0); }
+        }
+    }
+    Eigen::SparseMatrix<double> A(n, n);
+    A.setFromTriplets(trips.begin(), trips.end());
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> Y =
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>::Ones(n, 4);
+    for (int pass = 0; pass < 4; pass++)
+    {
+        CholeskyLDLT solver;
+        solver.analyzePattern(A);
+        solver.factorize(A);
+        Y = solver.permutationP() * Y;
+        ldltSolveInPlace(solver.matrixL().nestedExpression(), solver.vectorD(), Y.data(), int(Y.cols()));
+        Y = solver.permutationPinv() * Y;
+    }
+}
+
+static val sparseCholeskyCSRImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
+                                 uintptr_t bPtr, int rows, int nrhs)
+{
+    if (rows <= 0 || nrhs <= 0 || nnz < 0)
+        return choleskyFailure("InvalidInput", "rows and nrhs must be positive, nnz non-negative (rows=" +
+                                                   std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) +
+                                                   ", nnz=" + std::to_string(nnz) + ")");
+    if (!roPtr || !ciPtr || !vPtr || !bPtr)
+        return choleskyFailure("InvalidInput", "null heap pointer");
+
+    const std::string invalid = validateSquareCSR(reinterpret_cast<const int*>(roPtr),
+                                                  reinterpret_cast<const int*>(ciPtr), rows, nnz);
+    if (!invalid.empty())
+        return choleskyFailure("InvalidInput", "invalid CSR matrix: " + invalid);
+
+    warmUpCholeskyTiers();
+
+    const double t0 = emscripten_get_now();
+    CholeskyLDLT solver;
+    double t1, t2;
+    {
+        // A's column-major copy is only needed until the factorization is done.
+        const Eigen::SparseMatrix<double> A = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
+        solver.analyzePattern(A);
+        t1 = emscripten_get_now();
+        if (solver.info() != Eigen::Success)
+            return choleskyFailure("InvalidInput", "symbolic analysis failed");
+        solver.factorize(A);
+        t2 = emscripten_get_now();
     }
 
-    Eigen::MatrixXd X = solver.solve(B);
-    if (solver.info() != Eigen::Success)
+    const Eigen::VectorXd& D = solver.vectorD();
+    if (solver.info() != Eigen::Success || D.size() != rows)
+        return choleskyFailure("NotPositiveDefinite", "LDLT factorization hit a zero pivot; the matrix is singular");
+    double minPivot = D[0], maxPivot = D[0];
+    for (int j = 0; j < rows; j++)
     {
-        result.set("success", false);
-        result.set("error", std::string("Cholesky solve failed"));
-        return result;
+        if (!std::isfinite(D[j]))
+            return choleskyFailure("NotPositiveDefinite", "LDLT pivot " + std::to_string(j) +
+                                                              " is not finite; check the matrix for NaN or Inf");
+        minPivot = std::min(minPivot, D[j]);
+        maxPivot = std::max(maxPivot, D[j]);
     }
+    // A positive definite matrix has strictly positive pivots.  A pivot at
+    // rounding-noise level relative to the largest one means A is singular
+    // (for example a Laplacian with no diagonal term), and X would be noise.
+    const double tiny = maxPivot * double(rows) * std::numeric_limits<double>::epsilon();
+    if (minPivot <= tiny)
+        return choleskyFailure("NotPositiveDefinite",
+                               "matrix is not positive definite (smallest LDLT pivot " +
+                                   formatPivot(minPivot) + ", largest " + formatPivot(maxPivot) + ")");
 
+    double* Y = reinterpret_cast<double*>(bPtr);
+    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> B(Y, rows, nrhs);
+    B = solver.permutationP() * B;
+    ldltSolveInPlace(solver.matrixL().nestedExpression(), D, Y, nrhs);
+    B = solver.permutationPinv() * B;
+    const double t3 = emscripten_get_now();
+
+    val stats = val::object();
+    stats.set("analyzeMs", t1 - t0);
+    stats.set("factorizeMs", t2 - t1);
+    stats.set("solveMs", t3 - t2);
+    stats.set("factorNnz", double(solver.matrixL().nestedExpression().nonZeros()));
+    stats.set("minPivot", minPivot);
+    stats.set("maxPivot", maxPivot);
+
+    val data = val(typed_memory_view(std::size_t(rows) * nrhs, Y)).call<val>("slice");
+    val result = val::object();
     result.set("success", true);
     if (nrhs == 1)
     {
-        result.set("x", eigenVecToFloat64Array(Eigen::VectorXd(X.col(0))));
+        result.set("x", data);
     }
     else
     {
-        result.set("x", eigenMatToFloat64Array(X));
+        val x = val::object();
+        x.set("data", data);
+        x.set("rows", rows);
+        x.set("cols", nrhs);
+        result.set("x", x);
     }
+    result.set("stats", stats);
     return result;
+}
+
+// Every failure, including an allocation failure, comes back as
+// { success: false, ... } so callers need only one check.
+static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
+                             uintptr_t bPtr, int rows, int nrhs)
+{
+    try
+    {
+        return sparseCholeskyCSRImpl(roPtr, ciPtr, vPtr, nnz, bPtr, rows, nrhs);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return choleskyFailure("Exception", "out of memory during sparse Cholesky (rows=" +
+                                                std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) + ")");
+    }
+    catch (const std::exception& e)
+    {
+        return choleskyFailure("Exception", e.what());
+    }
 }
 
 // ============================================================
@@ -1293,5 +1535,5 @@ EMSCRIPTEN_BINDINGS(spectra)
     function("lobpcgGeneralizedCSR", SAFE(lobpcgGeneralizedCSR));
 
     // Standalone Eigen linear solvers
-    function("sparseCholeskyCSR", SAFE(sparseCholeskyCSR));
+    function("sparseCholeskyCSR", &sparseCholeskyCSR);
 }
