@@ -20,6 +20,9 @@ target_link_options(spectra-wasm PRIVATE
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createSpectra"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+    # A 32-bit heap may grow to 4 GB (wasm64 stays off for Safari): a 1.6M-triangle
+    # LSCM factor alone takes about 1.5 GB, past the 2 GB default.
+    "SHELL:-s MAXIMUM_MEMORY=4GB"
     "SHELL:-s ENVIRONMENT=web,node"
     "SHELL:-s WASM=1"
     "SHELL:-s WASM_BIGINT=1"

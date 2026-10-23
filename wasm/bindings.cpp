@@ -1361,37 +1361,12 @@ static void warmUpCholeskyTiers()
     }
 }
 
-static val sparseCholeskyCSRImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
-                                 uintptr_t bPtr, int rows, int nrhs)
+// The pivots' check, the triangular solves and the result, once `solver` has
+// factored: sparseCholeskyCSR's and sparseSolveSPD's.  t0..t2 time the analysis
+// and the factorization.
+static val ldltSolveFactored(const CholeskyLDLT& solver, double t0, double t1, double t2, uintptr_t bPtr, int rows,
+                             int nrhs)
 {
-    if (rows <= 0 || nrhs <= 0 || nnz < 0)
-        return choleskyFailure("InvalidInput", "rows and nrhs must be positive, nnz non-negative (rows=" +
-                                                   std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) +
-                                                   ", nnz=" + std::to_string(nnz) + ")");
-    if (!roPtr || !ciPtr || !vPtr || !bPtr)
-        return choleskyFailure("InvalidInput", "null heap pointer");
-
-    const std::string invalid = validateSquareCSR(reinterpret_cast<const int*>(roPtr),
-                                                  reinterpret_cast<const int*>(ciPtr), rows, nnz);
-    if (!invalid.empty())
-        return choleskyFailure("InvalidInput", "invalid CSR matrix: " + invalid);
-
-    warmUpCholeskyTiers();
-
-    const double t0 = emscripten_get_now();
-    CholeskyLDLT solver;
-    double t1, t2;
-    {
-        // A's column-major copy is only needed until the factorization is done.
-        const Eigen::SparseMatrix<double> A = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
-        solver.analyzePattern(A);
-        t1 = emscripten_get_now();
-        if (solver.info() != Eigen::Success)
-            return choleskyFailure("InvalidInput", "symbolic analysis failed");
-        solver.factorize(A);
-        t2 = emscripten_get_now();
-    }
-
     const Eigen::VectorXd& D = solver.vectorD();
     if (solver.info() != Eigen::Success || D.size() != rows)
         return choleskyFailure("NotPositiveDefinite", "LDLT factorization hit a zero pivot; the matrix is singular");
@@ -1447,6 +1422,40 @@ static val sparseCholeskyCSRImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPt
     return result;
 }
 
+static val sparseCholeskyCSRImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
+                                 uintptr_t bPtr, int rows, int nrhs)
+{
+    if (rows <= 0 || nrhs <= 0 || nnz < 0)
+        return choleskyFailure("InvalidInput", "rows and nrhs must be positive, nnz non-negative (rows=" +
+                                                   std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) +
+                                                   ", nnz=" + std::to_string(nnz) + ")");
+    if (!roPtr || !ciPtr || !vPtr || !bPtr)
+        return choleskyFailure("InvalidInput", "null heap pointer");
+
+    const std::string invalid = validateSquareCSR(reinterpret_cast<const int*>(roPtr),
+                                                  reinterpret_cast<const int*>(ciPtr), rows, nnz);
+    if (!invalid.empty())
+        return choleskyFailure("InvalidInput", "invalid CSR matrix: " + invalid);
+
+    warmUpCholeskyTiers();
+
+    const double t0 = emscripten_get_now();
+    CholeskyLDLT solver;
+    double t1, t2;
+    {
+        // A's column-major copy is only needed until the factorization is done.
+        const Eigen::SparseMatrix<double> A = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
+        solver.analyzePattern(A);
+        t1 = emscripten_get_now();
+        if (solver.info() != Eigen::Success)
+            return choleskyFailure("InvalidInput", "symbolic analysis failed");
+        solver.factorize(A);
+        t2 = emscripten_get_now();
+    }
+
+    return ldltSolveFactored(solver, t0, t1, t2, bPtr, rows, nrhs);
+}
+
 // Every failure, including an allocation failure, comes back as
 // { success: false, ... } so callers need only one check.
 static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz,
@@ -1460,6 +1469,170 @@ static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, i
     {
         return choleskyFailure("Exception", "out of memory during sparse Cholesky (rows=" +
                                                 std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) + ")");
+    }
+    catch (const std::exception& e)
+    {
+        return choleskyFailure("Exception", e.what());
+    }
+}
+
+// ============================================================
+// sparseSolveSPD — sparseCholeskyCSR without the assembly's rounding noise,
+// refused up front when its factor won't fit
+// ============================================================
+//
+// An assembly leaves entries its cancellations brought to rounding level:
+// LSCM's u-v couplings on interior edges come to about 1e-16 of the diagonal,
+// or to stored zeros, about half its off-diagonal entries.  Kept, they couple
+// u and v across the whole interior and double the factor: an LSCM system of
+// 400k rows factors to 55M nonzeros with them and 27M without, and one of 1.6M
+// rows to about 260M with them, more than a 32-bit WebAssembly heap holds.
+// So the factor is counted before anything is factored (the AMD ordering and
+// elimination tree SimplicialLDLT's analysis uses, without allocating L).  One
+// that fits `budgetBytes` is made from the matrix as given, and the result is
+// sparseCholeskyCSR's, bit for bit.  One that doesn't is counted again with
+// the entries |a_ij| <= 1e-14 sqrt(|a_ii a_jj|) dropped, a change at the level
+// of the assembly's own rounding, and made from that if it fits.  Otherwise
+// the solve fails with info "TooLarge" and the bytes it would need, instead of
+// failing partway through an allocation, so a matrix always meets the same
+// outcome.
+//
+//   sparseSolveSPD(ro, ci, v, nnz, b, rows, nrhs, budgetBytes)
+//   Returns what sparseCholeskyCSR returns, its stats with droppedNnz (the
+//   entries dropped) and countMs.
+
+static constexpr double kRoundingNoise = 1e-14;
+
+static Eigen::SparseMatrix<double> withoutRoundingNoise(const Eigen::SparseMatrix<double>& A)
+{
+    const Eigen::VectorXd diag = A.diagonal().cwiseAbs();
+    Eigen::SparseMatrix<double> F = A;
+    F.prune([&](Eigen::Index i, Eigen::Index j, double value) {
+        return i == j || std::abs(value) > kRoundingNoise * std::sqrt(diag[i] * diag[j]);
+    });
+    return F;
+}
+
+// The nonzeros SimplicialLDLT's L would hold for A (its lower triangle read),
+// counted as Eigen's analyzePattern_preordered counts them.
+static double ldltFactorNonZeros(const Eigen::SparseMatrix<double>& A)
+{
+    const int n = int(A.cols());
+    Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> Pinv, P;
+    {
+        Eigen::SparseMatrix<double> C = A.selfadjointView<Eigen::Lower>();
+        Eigen::AMDOrdering<int> ordering;
+        ordering(C, Pinv);
+    }
+    P = Pinv.inverse();
+    Eigen::SparseMatrix<double> ap(n, n);
+    ap.selfadjointView<Eigen::Upper>() = A.selfadjointView<Eigen::Lower>().twistedBy(P);
+    std::vector<int> parent(n, -1), tags(n), count(n, 0);
+    for (int k = 0; k < n; ++k)
+    {
+        tags[k] = k;
+        for (Eigen::SparseMatrix<double>::InnerIterator it(ap, k); it; ++it)
+        {
+            int i = int(it.index());
+            if (i < k)
+            {
+                for (; tags[i] != k; i = parent[i])
+                {
+                    if (parent[i] == -1)
+                        parent[i] = k;
+                    count[i]++;
+                    tags[i] = k;
+                }
+            }
+        }
+    }
+    double total = 0;
+    for (int k = 0; k < n; ++k)
+        total += count[k];
+    return total;
+}
+
+static std::string gigabytes(double bytes)
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.2f GB", bytes / 1e9);
+    return buffer;
+}
+
+static val sparseSolveSPDImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz, uintptr_t bPtr, int rows,
+                              int nrhs, double budgetBytes)
+{
+    if (rows <= 0 || nrhs <= 0 || nnz < 0)
+        return choleskyFailure("InvalidInput", "rows and nrhs must be positive, nnz non-negative (rows=" +
+                                                   std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) +
+                                                   ", nnz=" + std::to_string(nnz) + ")");
+    if (!roPtr || !ciPtr || !vPtr || !bPtr)
+        return choleskyFailure("InvalidInput", "null heap pointer");
+    const std::string invalid = validateSquareCSR(reinterpret_cast<const int*>(roPtr),
+                                                  reinterpret_cast<const int*>(ciPtr), rows, nnz);
+    if (!invalid.empty())
+        return choleskyFailure("InvalidInput", "invalid CSR matrix: " + invalid);
+
+    warmUpCholeskyTiers();
+
+    // L's values and row indices, and the analysis's permuted copies of the matrix.
+    const auto bytesFor = [rows](double factorNnz, double matrixNnz) {
+        return factorNnz * 12.0 + matrixNnz * 24.0 + double(rows) * 64.0;
+    };
+    const double tCount = emscripten_get_now();
+    Eigen::SparseMatrix<double> F = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
+    double factorNnz = ldltFactorNonZeros(F);
+    double needBytes = bytesFor(factorNnz, double(nnz));
+    double droppedNnz = 0;
+    // A factor that fits is made from the matrix as given, so the result is sparseCholeskyCSR's, bit for bit; the
+    // rounding noise is dropped only from one that doesn't.
+    if (needBytes > budgetBytes)
+    {
+        F = withoutRoundingNoise(F);
+        droppedNnz = double(nnz) - double(F.nonZeros());
+        factorNnz = ldltFactorNonZeros(F);
+        needBytes = bytesFor(factorNnz, double(F.nonZeros()));
+    }
+    if (needBytes > budgetBytes)
+    {
+        val result = choleskyFailure("TooLarge", "the factor needs " + gigabytes(needBytes) + ", over the budget of " +
+                                                     gigabytes(budgetBytes) + " (rows=" + std::to_string(rows) +
+                                                     ", factor nonzeros=" + std::to_string(std::llround(factorNnz)) + ")");
+        result.set("needBytes", needBytes);
+        return result;
+    }
+
+    const double t0 = emscripten_get_now();
+    CholeskyLDLT solver;
+    solver.analyzePattern(F);
+    const double t1 = emscripten_get_now();
+    if (solver.info() != Eigen::Success)
+        return choleskyFailure("InvalidInput", "symbolic analysis failed");
+    solver.factorize(F);
+    const double t2 = emscripten_get_now();
+    F = Eigen::SparseMatrix<double>();
+
+    val result = ldltSolveFactored(solver, t0, t1, t2, bPtr, rows, nrhs);
+    if (result["success"].as<bool>())
+    {
+        val stats = result["stats"];
+        stats.set("countMs", t0 - tCount);
+        stats.set("droppedNnz", droppedNnz);
+    }
+    return result;
+}
+
+static val sparseSolveSPD(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz, uintptr_t bPtr, int rows,
+                          int nrhs, double budgetBytes)
+{
+    try
+    {
+        return sparseSolveSPDImpl(roPtr, ciPtr, vPtr, nnz, bPtr, rows, nrhs, budgetBytes);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return choleskyFailure("Exception", "out of memory during sparse solve (rows=" + std::to_string(rows) +
+                                                ", nrhs=" + std::to_string(nrhs) + ")");
     }
     catch (const std::exception& e)
     {
@@ -1536,4 +1709,5 @@ EMSCRIPTEN_BINDINGS(spectra)
 
     // Standalone Eigen linear solvers
     function("sparseCholeskyCSR", &sparseCholeskyCSR);
+    function("sparseSolveSPD", &sparseSolveSPD);
 }
