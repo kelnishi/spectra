@@ -1497,11 +1497,20 @@ static val sparseCholeskyCSR(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, i
 // failing partway through an allocation, so a matrix always meets the same
 // outcome.
 //
-//   sparseSolveSPD(ro, ci, v, nnz, b, rows, nrhs, budgetBytes)
+// `noise` says what becomes of that noise: kNoiseWhenNeeded (0) drops it only
+// from a factor that doesn't fit, as above; kNoiseDrop (1) drops it from every
+// matrix, which halves an LSCM factor at any size and changes the solution at
+// the level of the assembly's rounding; kNoiseKeep (2) never drops it, so the
+// result is sparseCholeskyCSR's or the solve is refused as TooLarge.
+//
+//   sparseSolveSPD(ro, ci, v, nnz, b, rows, nrhs, budgetBytes, noise)
 //   Returns what sparseCholeskyCSR returns, its stats with droppedNnz (the
 //   entries dropped) and countMs.
 
 static constexpr double kRoundingNoise = 1e-14;
+static constexpr int kNoiseWhenNeeded = 0;
+static constexpr int kNoiseDrop = 1;
+static constexpr int kNoiseKeep = 2;
 
 static Eigen::SparseMatrix<double> withoutRoundingNoise(const Eigen::SparseMatrix<double>& A)
 {
@@ -1560,8 +1569,11 @@ static std::string gigabytes(double bytes)
 }
 
 static val sparseSolveSPDImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz, uintptr_t bPtr, int rows,
-                              int nrhs, double budgetBytes)
+                              int nrhs, double budgetBytes, int noise)
 {
+    if (noise != kNoiseWhenNeeded && noise != kNoiseDrop && noise != kNoiseKeep)
+        return choleskyFailure("InvalidInput", "noise must be 0 (drop when needed), 1 (drop) or 2 (keep), not " +
+                                                   std::to_string(noise));
     if (rows <= 0 || nrhs <= 0 || nnz < 0)
         return choleskyFailure("InvalidInput", "rows and nrhs must be positive, nnz non-negative (rows=" +
                                                    std::to_string(rows) + ", nrhs=" + std::to_string(nrhs) +
@@ -1581,12 +1593,17 @@ static val sparseSolveSPDImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, 
     };
     const double tCount = emscripten_get_now();
     Eigen::SparseMatrix<double> F = ptrToSparseCSR(roPtr, ciPtr, vPtr, rows, rows, nnz);
-    double factorNnz = ldltFactorNonZeros(F);
-    double needBytes = bytesFor(factorNnz, double(nnz));
     double droppedNnz = 0;
-    // A factor that fits is made from the matrix as given, so the result is sparseCholeskyCSR's, bit for bit; the
-    // rounding noise is dropped only from one that doesn't.
-    if (needBytes > budgetBytes)
+    if (noise == kNoiseDrop)
+    {
+        F = withoutRoundingNoise(F);
+        droppedNnz = double(nnz) - double(F.nonZeros());
+    }
+    double factorNnz = ldltFactorNonZeros(F);
+    double needBytes = bytesFor(factorNnz, noise == kNoiseDrop ? double(F.nonZeros()) : double(nnz));
+    // Dropping only when needed, a factor that fits is made from the matrix as given, so the result is
+    // sparseCholeskyCSR's, bit for bit; the rounding noise is dropped only from one that doesn't.
+    if (noise == kNoiseWhenNeeded && needBytes > budgetBytes)
     {
         F = withoutRoundingNoise(F);
         droppedNnz = double(nnz) - double(F.nonZeros());
@@ -1623,11 +1640,11 @@ static val sparseSolveSPDImpl(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, 
 }
 
 static val sparseSolveSPD(uintptr_t roPtr, uintptr_t ciPtr, uintptr_t vPtr, int nnz, uintptr_t bPtr, int rows,
-                          int nrhs, double budgetBytes)
+                          int nrhs, double budgetBytes, int noise)
 {
     try
     {
-        return sparseSolveSPDImpl(roPtr, ciPtr, vPtr, nnz, bPtr, rows, nrhs, budgetBytes);
+        return sparseSolveSPDImpl(roPtr, ciPtr, vPtr, nnz, bPtr, rows, nrhs, budgetBytes, noise);
     }
     catch (const std::bad_alloc&)
     {
