@@ -28,6 +28,9 @@
 #include <Spectra/MatOp/SymShiftInvert.h>
 
 #include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <new>
 #include <string>
 #include <algorithm>
 #include <cstdint>
@@ -58,14 +61,51 @@ static val eigenVecToJS(const Eigen::VectorXd& v)
     return arr;
 }
 
-// Zero-copy TypedArray output — bulk memcpy via typed_memory_view + slice()
+// Result mode.  Off (the default), a TypedArray result is an embind slice() copy, a Float64Array the caller owns.  On
+// (setPointerResults(true)), it is {ptr, length} of a block this module malloc'd, which the caller copies from once
+// and releases with _free, so no JS array is allocated for it.  A matrix adds rows and cols and has no `data`.
+static bool g_pointerResults = false;
+
+static void setPointerResults(bool on) { g_pointerResults = on; }
+
+static double* mallocDoubles(std::size_t count)
+{
+    void* p = std::malloc(std::max<std::size_t>(count, 1) * sizeof(double));
+    if (!p) throw std::bad_alloc();
+    return static_cast<double*>(p);
+}
+
+static val pointerBlock(const double* ptr, std::size_t count)
+{
+    val result = val::object();
+    result.set("ptr", reinterpret_cast<uintptr_t>(ptr));
+    result.set("length", static_cast<unsigned>(count));
+    return result;
+}
+
 static val eigenVecToFloat64Array(const Eigen::VectorXd& v)
 {
+    if (g_pointerResults)
+    {
+        double* out = mallocDoubles(v.size());
+        std::memcpy(out, v.data(), v.size() * sizeof(double));
+        return pointerBlock(out, v.size());
+    }
     return val(typed_memory_view(v.size(), v.data())).call<val>("slice");
 }
 
 static val eigenMatToFloat64Array(const Eigen::MatrixXd& m)
 {
+    if (g_pointerResults)
+    {
+        // Written row-major straight into the result block, with no temporary.
+        double* out = mallocDoubles(m.size());
+        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(out, m.rows(), m.cols()) = m;
+        val result = pointerBlock(out, m.size());
+        result.set("rows", (int)m.rows());
+        result.set("cols", (int)m.cols());
+        return result;
+    }
     Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rowMajor(m);
     val result = val::object();
     result.set("data", val(typed_memory_view(rowMajor.size(), rowMajor.data())).call<val>("slice"));
@@ -1403,11 +1443,19 @@ static val ldltSolveFactored(const CholeskyLDLT& solver, double t0, double t1, d
     stats.set("minPivot", minPivot);
     stats.set("maxPivot", maxPivot);
 
-    val data = val(typed_memory_view(std::size_t(rows) * nrhs, Y)).call<val>("slice");
+    // Pointer results: the solution is B, which the caller allocated, so x borrows its block and nothing is released.
+    val data = g_pointerResults ? pointerBlock(Y, std::size_t(rows) * nrhs)
+                                : val(typed_memory_view(std::size_t(rows) * nrhs, Y)).call<val>("slice");
     val result = val::object();
     result.set("success", true);
     if (nrhs == 1)
     {
+        result.set("x", data);
+    }
+    else if (g_pointerResults)
+    {
+        data.set("rows", rows);
+        data.set("cols", nrhs);
         result.set("x", data);
     }
     else
@@ -1664,6 +1712,7 @@ EMSCRIPTEN_BINDINGS(spectra)
 {
     // Utility (no solver — no exception wrapping needed)
     function("estimateOps", &estimateOps);
+    function("setPointerResults", &setPointerResults);
 
     // All solver functions wrapped with SAFE() to catch C++ exceptions
     // and return {converged: false, error: "..."} instead of opaque
